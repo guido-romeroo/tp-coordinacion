@@ -2,7 +2,8 @@ import os
 import logging
 import bisect
 
-from common import middleware, message_protocol, fruit_item
+from common import middleware, fruit_item
+from common.message_protocol.internal import ProtocolMessage
 
 ID = int(os.environ["ID"])
 MOM_HOST = os.environ["MOM_HOST"]
@@ -23,38 +24,44 @@ class AggregationFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
-        self.fruit_top = []
+        self.fruit_top_by_id = {}
 
-    def _process_data(self, fruit, amount):
+    def _process_data(self, msg):
         logging.info("Processing data message")
-        for i in range(len(self.fruit_top)):
-            if self.fruit_top[i].fruit == fruit:
-                self.fruit_top[i] = self.fruit_top[i] + fruit_item.FruitItem(
+        [fruit, amount] = msg.fruit_items.pop()
+        top = self.fruit_top_by_id.get(msg.id, [])
+        item = fruit_item.FruitItem(fruit, amount)
+        for i in range(len(top)):
+            if top[i].fruit == fruit:
+                item = top.pop(i)
+                item = item + fruit_item.FruitItem(
                     fruit, amount
                 )
-                return
-        bisect.insort(self.fruit_top, fruit_item.FruitItem(fruit, amount))
+                break
+        bisect.insort(top, item)
+        self.fruit_top_by_id[msg.id] = top
 
-    def _process_eof(self):
+    def _process_eof(self, msg):
         logging.info("Received EOF")
-        fruit_chunk = list(self.fruit_top[-TOP_SIZE:])
+        top = self.fruit_top_by_id.get(msg.id, [])
+        fruit_chunk = list(top[-TOP_SIZE:])
         fruit_chunk.reverse()
         fruit_top = list(
             map(
-                lambda fruit_item: (fruit_item.fruit, fruit_item.amount),
+                lambda fruit_item: [fruit_item.fruit, fruit_item.amount],
                 fruit_chunk,
             )
         )
-        self.output_queue.send(message_protocol.internal.serialize(fruit_top))
-        del self.fruit_top
+        self.output_queue.send(ProtocolMessage(msg.id, fruit_top).serialize())
+        del self.fruit_top_by_id[msg.id]
 
     def process_messsage(self, message, ack, nack):
         logging.info("Process message")
-        fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 2:
-            self._process_data(*fields)
+        msg = ProtocolMessage.deserialize(message)
+        if msg.is_eof():
+            self._process_eof(msg)
         else:
-            self._process_eof()
+            self._process_data(msg)
         ack()
 
     def start(self):
