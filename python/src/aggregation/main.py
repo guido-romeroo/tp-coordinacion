@@ -3,7 +3,7 @@ import logging
 import bisect
 
 from common import middleware, fruit_item
-from common.message_protocol.internal import ProtocolMessage
+from common.message_protocol.internal import ProtocolMessage, ProtocolMessageType
 
 ID = int(os.environ["ID"])
 MOM_HOST = os.environ["MOM_HOST"]
@@ -25,11 +25,12 @@ class AggregationFilter:
             MOM_HOST, OUTPUT_QUEUE
         )
         self.fruit_top_by_id = {}
+        self.eof_amount_by_id = {}
 
-    def _process_data(self, msg):
+    def _process_data(self, msg: ProtocolMessage):
         logging.info("Processing data message")
-        [fruit, amount] = msg.fruit_items.pop()
-        top = self.fruit_top_by_id.get(msg.id, [])
+        [fruit, amount] = msg.payload.pop()
+        top = self.fruit_top_by_id.get(msg.client_id, [])
         item = fruit_item.FruitItem(fruit, amount)
         for i in range(len(top)):
             if top[i].fruit == fruit:
@@ -39,11 +40,15 @@ class AggregationFilter:
                 )
                 break
         bisect.insort(top, item)
-        self.fruit_top_by_id[msg.id] = top
+        self.fruit_top_by_id[msg.client_id] = top
 
-    def _process_eof(self, msg):
+    # TODO: contar la cantidad de eofs recibidos y calcular cuando sea igual a sum_amount
+    def _process_eof(self, msg: ProtocolMessage):
+        self.eof_amount_by_id[msg.client_id] = self.eof_amount_by_id.get(msg.client_id, 0) + 1
         logging.info("Received EOF")
-        top = self.fruit_top_by_id.get(msg.id, [])
+        if self.eof_amount_by_id[msg.client_id] < SUM_AMOUNT:
+            return
+        top = self.fruit_top_by_id.get(msg.client_id, [])
         fruit_chunk = list(top[-TOP_SIZE:])
         fruit_chunk.reverse()
         fruit_top = list(
@@ -52,8 +57,9 @@ class AggregationFilter:
                 fruit_chunk,
             )
         )
-        self.output_queue.send(ProtocolMessage(msg.id, fruit_top).serialize())
-        del self.fruit_top_by_id[msg.id]
+        self.output_queue.send(ProtocolMessage(ProtocolMessageType.FRUITS, msg.client_id, msg.msg_id, fruit_top).serialize())
+        del self.fruit_top_by_id[msg.client_id]
+        del self.eof_amount_by_id[msg.client_id]
 
     def process_messsage(self, message, ack, nack):
         logging.info("Process message")
