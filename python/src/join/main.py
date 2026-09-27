@@ -1,5 +1,6 @@
 import os
 import logging
+import heapq
 
 from common import middleware, fruit_item
 from common.message_protocol.internal import ProtocolMessage
@@ -23,11 +24,26 @@ class JoinFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
+        self.fruit_top_by_id = {}
+        self.top_count_by_id = {}
+
+    def merge_tops(self, msg: ProtocolMessage):
+        logging.info("Merging tops")
+        top = self.fruit_top_by_id.get(msg.client_id, [])
+        if not top:
+            return msg.payload
+        return list(heapq.merge(top, msg.payload, key=lambda pair: pair[1], reverse=True))[0:TOP_SIZE]
 
     def process_messsage(self, message, ack, nack):
         logging.info("Received top")
-        fruit_top_msg = ProtocolMessage.deserialize(message)
-        self.output_queue.send(fruit_top_msg.serialize())
+        msg = ProtocolMessage.deserialize(message)
+        self.fruit_top_by_id[msg.client_id] = self.merge_tops(msg)
+        self.top_count_by_id[msg.client_id] = self.top_count_by_id.get(msg.client_id, 0) + 1
+        if self.top_count_by_id[msg.client_id] == AGGREGATION_AMOUNT:
+            msg.payload = self.fruit_top_by_id[msg.client_id]
+            self.output_queue.send(msg.serialize())
+            del self.fruit_top_by_id[msg.client_id]
+            del self.top_count_by_id[msg.client_id]
         ack()
 
     def start(self):

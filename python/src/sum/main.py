@@ -44,15 +44,25 @@ class SumFilter:
         self.items_by_client_id[msg.client_id] = items
         self.msg_processed_count[msg.client_id] = self.msg_processed_count.get(msg.client_id, 0) + 1
 
+    def _map_fruit_to_aggregator(self, fruit):
+        OFFSET_BASIS = 2166136261
+        FNV_PRIME = 16777619
+
+        hash = OFFSET_BASIS
+        for caracter in fruit:
+          hash ^= ord(caracter)
+          hash *= FNV_PRIME
+        return hash % AGGREGATION_AMOUNT
+
     # TODO: enviar cada fruta a un mismo agreggator, unificar esto para todas las instancias de sum, para evitar que los tops parciales se calculen incompletos
     def _send_sums(self, msg: ProtocolMessage):
         logging.info(f"Sending sums messages")
         items = self.items_by_client_id.get(msg.client_id, {})
         for final_fruit_item in items.values():
-            for data_output_exchange in self.data_output_exchanges:
-                data_output_exchange.send(
-                    ProtocolMessage(ProtocolMessageType.FRUITS, msg.client_id, msg.msg_id, [[final_fruit_item.fruit, final_fruit_item.amount]]).serialize()
-                )
+            data_output_exchange = self.data_output_exchanges[self._map_fruit_to_aggregator(final_fruit_item.fruit)]
+            data_output_exchange.send(
+                ProtocolMessage(ProtocolMessageType.FRUITS, msg.client_id, msg.msg_id, [[final_fruit_item.fruit, final_fruit_item.amount]]).serialize()
+            )
     def broadcast_eof_to_other_sums(self, msg: ProtocolMessage):
         logging.info(f"Broadcasting EOF message to other sums")
         peers = [f"{SUM_CONTROL_EXCHANGE}_{i}" for i in range(SUM_AMOUNT) if i != ID]
