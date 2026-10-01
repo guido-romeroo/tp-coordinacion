@@ -1,6 +1,7 @@
 import os
 import logging
 import heapq
+import signal
 
 from common import middleware, fruit_item
 from common.message_protocol.internal import ProtocolMessage
@@ -13,7 +14,6 @@ SUM_PREFIX = os.environ["SUM_PREFIX"]
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 TOP_SIZE = int(os.environ["TOP_SIZE"])
-
 
 class JoinFilter:
 
@@ -46,8 +46,20 @@ class JoinFilter:
             del self.top_count_by_id[msg.client_id]
         ack()
 
+    def handle_sigterm(self, _signum, _frame):
+        logging.info("SIGTERM received, shutting down...")
+        self.input_queue.stop_consuming()
+
     def start(self):
-        self.input_queue.start_consuming(self.process_messsage)
+        signal.signal(signal.SIGTERM, self.handle_sigterm)
+        try:
+            self.input_queue.start_consuming(self.process_messsage)
+        except Exception as e:
+            logging.error(f"Error starting consuming: {e}")
+            self.input_queue.stop_consuming()
+        finally:
+            self.input_queue.close()
+            self.output_queue.close()
 
 
 def main():

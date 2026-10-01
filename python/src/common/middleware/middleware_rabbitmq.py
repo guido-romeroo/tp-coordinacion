@@ -51,6 +51,14 @@ class Consumer:
         except Exception as e:
             raise MessageMiddlewareMessageError() from e
 
+    def stop_consuming_threadsafe(self, connection):
+        try:
+            connection.add_callback_threadsafe(self.channel.stop_consuming)
+        except (AMQPConnectionError, AMQPChannelError):
+            raise MessageMiddlewareDisconnectedError()
+        except Exception as e:
+            raise MessageMiddlewareMessageError() from e
+
 class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
 
     def __init__(self, host, queue_name):
@@ -88,6 +96,9 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
         self.connection_manager.validate_connection()
         self.consumer.stop_consuming()
 
+    def stop_consuming_threadsafe(self):
+        self.connection_manager.validate_connection()
+        self.consumer.stop_consuming_threadsafe(self.connection_manager.connection)
 
 class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
     
@@ -131,3 +142,7 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
     def stop_consuming(self):
         self.connection_mannager.validate_connection()
         self.consumer.stop_consuming()
+
+    def stop_consuming_threadsafe(self):
+        self.connection_mannager.validate_connection()
+        self.consumer.stop_consuming_threadsafe(self.connection_mannager.connection)

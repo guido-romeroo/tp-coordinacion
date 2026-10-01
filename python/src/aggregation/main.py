@@ -1,6 +1,7 @@
 import os
 import logging
 import bisect
+import signal
 
 from common import middleware, fruit_item
 from common.message_protocol.internal import ProtocolMessage, ProtocolMessageType
@@ -13,7 +14,6 @@ SUM_PREFIX = os.environ["SUM_PREFIX"]
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 TOP_SIZE = int(os.environ["TOP_SIZE"])
-
 
 class AggregationFilter:
 
@@ -42,7 +42,6 @@ class AggregationFilter:
         bisect.insort(top, item)
         self.fruit_top_by_id[msg.client_id] = top
 
-    # TODO: contar la cantidad de eofs recibidos y calcular cuando sea igual a sum_amount
     def _process_eof(self, msg: ProtocolMessage):
         self.eof_amount_by_id[msg.client_id] = self.eof_amount_by_id.get(msg.client_id, 0) + 1
         logging.info("Received EOF")
@@ -70,9 +69,19 @@ class AggregationFilter:
             self._process_data(msg)
         ack()
 
-    def start(self):
-        self.input_exchange.start_consuming(self.process_messsage)
+    def handle_sigterm(self, _signum, _frame):
+        logging.info("SIGTERM received, shutting down...")
+        self.input_exchange.stop_consuming()
 
+    def start(self):
+        signal.signal(signal.SIGTERM, self.handle_sigterm)
+        try:
+            self.input_exchange.start_consuming(self.process_messsage)
+        except Exception as e:
+            logging.error(f"Error starting consuming: {e}")
+        finally:
+            self.input_exchange.close()
+            self.output_queue.close()
 
 def main():
     logging.basicConfig(level=logging.INFO)

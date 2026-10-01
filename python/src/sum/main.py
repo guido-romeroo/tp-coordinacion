@@ -2,6 +2,7 @@ import os
 import logging
 import queue
 import threading
+import signal
 
 from common import middleware, fruit_item
 from common.message_protocol.internal import ProtocolMessage, ProtocolMessageType
@@ -21,6 +22,9 @@ class SumFilter:
         self.messages_queue = queue.Queue()
         self.items_by_client_id = {}
         self.msg_processed_count = {}
+
+        self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, INPUT_QUEUE)
+        self.control_queue = middleware.MessageMiddlewareExchangeRabbitMQ(MOM_HOST, SUM_CONTROL_EXCHANGE, [f"{SUM_CONTROL_EXCHANGE}_{ID}"])
     
     @staticmethod
     def _construct_data_output_exchanges():
@@ -69,7 +73,10 @@ class SumFilter:
         if not peers:
             return
         control_output = middleware.MessageMiddlewareExchangeRabbitMQ(MOM_HOST, SUM_CONTROL_EXCHANGE, peers)
-        control_output.send(msg.serialize())
+        try:
+            control_output.send(msg.serialize())
+        finally:
+            control_output.close()
 
     def _send_eof_to_aggregators(self, msg: ProtocolMessage):
         logging.info(f"Sending EOF message to aggregation filters")
@@ -112,7 +119,10 @@ class SumFilter:
         control_output = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, SUM_CONTROL_EXCHANGE, [f"{SUM_CONTROL_EXCHANGE}_{peer}"]
         )
-        control_output.send(msg.serialize())
+        try:
+            control_output.send(msg.serialize())
+        finally:
+            control_output.close()
 
 
     def process_data_messsage(self, msg: ProtocolMessage):
@@ -121,61 +131,57 @@ class SumFilter:
         else:
             self._process_data(msg)
 
-    def _listen_client_messages(self):
-        input_queue = middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, INPUT_QUEUE)
-        def dispatch_client_message(message, ack, nack):
-            try:
-                msg: ProtocolMessage = ProtocolMessage.deserialize(message)
-                ack_queue = queue.Queue()
-                self.messages_queue.put((msg, ack_queue))
-                ack_queue.get()
-                ack()
-            except Exception as e:
-                logging.error(f"Error processing message: {e}")
-                nack()
-                input_queue.stop_consuming()
+    def _listen_messages(self, queue_msg):
+        try:
+            def dispatch_message(message, ack, nack):
+                try:
+                    msg: ProtocolMessage = ProtocolMessage.deserialize(message)
+                    ack_queue = queue.Queue()
+                    self.messages_queue.put((msg, ack_queue))
+                    if ack_queue.get():
+                        ack()
+                    else:
+                        nack()
+                except queue.ShutDown as e:
+                    logging.error(f"ShutDown received: {e}")
+                    nack()
+                    queue_msg.stop_consuming()
+            queue_msg.start_consuming(dispatch_message)
+        finally:
+            queue_msg.close()
 
-        input_queue.start_consuming(dispatch_client_message)
-        input_queue.close()
+    def handle_sigterm(self, _signum, _frame):
+        logging.info("Received SIGTERM signal")
+        self.messages_queue.shutdown(immediate=False)
 
-    def _listen_control_messages(self):
-        control_input = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST, SUM_CONTROL_EXCHANGE, [f"{SUM_CONTROL_EXCHANGE}_{ID}"]
-        )
-        def dispatch_control_message(message, ack, nack):
-            try:
-                msg: ProtocolMessage = ProtocolMessage.deserialize(message)
-                ack_queue = queue.Queue()
-                self.messages_queue.put((msg, ack_queue))
-                ack_queue.get()
-                ack()
-            except Exception as e:
-                logging.error(f"Error processing message: {e}")
-                nack()
-                control_input.stop_consuming()
-
-        control_input.start_consuming(dispatch_control_message)
-        control_input.close()
-    
     def start(self):
-        client_listener = threading.Thread(target=self._listen_client_messages)
-        control_listener = threading.Thread(target=self._listen_control_messages)
+        signal.signal(signal.SIGTERM, self.handle_sigterm)
+        client_listener = threading.Thread(target=self._listen_messages, args=(self.input_queue,))
+        control_listener = threading.Thread(target=self._listen_messages, args=(self.control_queue,))
         client_listener.start()
         control_listener.start()
-        ack_queue = None
         while True:
             try:
                 msg, ack_queue = self.messages_queue.get()
                 self.process_data_messsage(msg)
                 ack_queue.put(True)
-            except Exception as e:
-                logging.error(f"Error processing message: {e}")
-                self.messages_queue.shutdown(immediate=False)
-                if ack_queue:
-                    ack_queue.shutdown(immediate=True)
+            except queue.ShutDown as e:
+                try:
+                    self.input_queue.stop_consuming_threadsafe()
+                except Exception as e:
+                    logging.error(f"Error stopping consuming: {e}") 
+                try:
+                    self.control_queue.stop_consuming_threadsafe()
+                except Exception as e:
+                    logging.error(f"Error stopping consuming: {e}") 
+                    
                 for exchange in self.data_output_exchanges:
                     exchange.close()
                 break
+            except Exception as e:
+                logging.error(f"Error processing message: {e}")
+                self.messages_queue.shutdown(immediate=False)
+                ack_queue.put(False)
         control_listener.join()
         client_listener.join()
 
